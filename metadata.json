@@ -1,0 +1,6 @@
+{
+  "name": "YouTube Analyzer AI",
+  "description": "Professional YouTube analytics and channel intelligence platform created and published by Wasim Akram. Connect your YouTube channel securely via Google OAuth 2.0 or analyze public channels with AI optimization.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

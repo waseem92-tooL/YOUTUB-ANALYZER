@@ -8,180 +8,266 @@ import type {
   ChannelComparisonResult,
   ScriptDoctorResult,
   ThumbnailStudioResult,
+  BestTimeAnalysisResponse,
+  KeywordGapResponse,
+  NextVideoPlanResponse,
 } from '../types.ts';
 
-export async function fetchAuthStatus(): Promise<AuthStatusResponse> {
-  const res = await fetch('/api/auth/status');
-  if (!res.ok) throw new Error('Failed to fetch auth status');
-  return res.json();
-}
+/**
+ * Safe JSON parsing fetch helper for Cloudflare Worker & API routes.
+ * Ensures all /api/... calls receive valid JSON with clear, friendly error messages on syntax failures.
+ */
+export async function safeFetchJson<T>(url: string, options?: RequestInit): Promise<T> {
+  const defaultHeaders: Record<string, string> = {
+    'Accept': 'application/json',
+  };
 
-export async function getGoogleAuthUrl(): Promise<{ url: string; redirectUri: string; scopes: string[] }> {
-  const res = await fetch('/api/auth/google/url');
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data.message || 'Failed to generate Google OAuth URL');
+  if (options?.body && typeof options.body === 'string') {
+    defaultHeaders['Content-Type'] = 'application/json';
   }
-  return data;
+
+  const mergedHeaders = {
+    ...defaultHeaders,
+    ...((options?.headers as Record<string, string>) || {}),
+  };
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      ...options,
+      credentials: options?.credentials || 'include',
+      headers: mergedHeaders,
+    });
+  } catch (netErr: any) {
+    throw new Error(`Network connection error calling ${url}: ${netErr.message || 'Please check your internet connection.'}`);
+  }
+
+  const rawText = await response.text();
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch (parseErr: any) {
+    const preview = rawText.slice(0, 140).replace(/\s+/g, ' ');
+    throw new Error(
+      `Invalid JSON response from server at ${url} (HTTP ${response.status} ${response.statusText}). Server responded: "${preview}${rawText.length > 140 ? '...' : ''}". Expected Content-Type: application/json.`
+    );
+  }
+
+  if (!response.ok) {
+    const errorMsg =
+      parsed?.error ||
+      parsed?.message ||
+      `API request to ${url} failed with status ${response.status} (${response.statusText})`;
+    throw new Error(errorMsg);
+  }
+
+  return parsed as T;
 }
 
-export async function simulateConnect(persona = 'tech'): Promise<{ success: boolean; user: UserProfile }> {
-  const res = await fetch('/api/auth/simulate-connect', {
+// -------------------------------------------------------------
+// 1. Auth Status & Edge Session Check
+// -------------------------------------------------------------
+export async function fetchAuthStatus(): Promise<AuthStatusResponse> {
+  try {
+    return await safeFetchJson<AuthStatusResponse>('/api/auth/status');
+  } catch (err: any) {
+    console.warn('Could not fetch session from /api/auth/status, checking local state:', err);
+    return {
+      authenticated: false,
+      user: null,
+      config: {
+        hasGoogleClientId: false,
+        hasGoogleClientSecret: false,
+        hasYoutubeApiKey: false,
+        hasGeminiKey: false,
+        redirectUriDev: typeof window !== 'undefined' ? `${window.location.origin}/api/auth/callback` : '/api/auth/callback',
+        redirectUriShared: typeof window !== 'undefined' ? `${window.location.origin}/api/auth/callback` : '/api/auth/callback',
+        activeRedirectUri: typeof window !== 'undefined' ? `${window.location.origin}/api/auth/callback` : '/api/auth/callback',
+        environment: 'production',
+      },
+    };
+  }
+}
+
+// -------------------------------------------------------------
+// 2. Google OAuth URL / Authorization
+// -------------------------------------------------------------
+export async function getGoogleAuthUrl(): Promise<{
+  url: string;
+  redirectUri: string;
+  scopes: string[];
+  configured?: boolean;
+}> {
+  return await safeFetchJson<{
+    url: string;
+    redirectUri: string;
+    scopes: string[];
+    configured?: boolean;
+  }>('/api/auth/login');
+}
+
+// -------------------------------------------------------------
+// 3. Simulated Connection (Instant Verification)
+// -------------------------------------------------------------
+export async function simulateConnect(persona = 'tech'): Promise<{ success: boolean; user: UserProfile; channel?: ChannelData }> {
+  return await safeFetchJson<{ success: boolean; user: UserProfile; channel?: ChannelData }>(
+    '/api/auth/simulate-connect',
+    {
+      method: 'POST',
+      body: JSON.stringify({ persona }),
+    }
+  );
+}
+
+// -------------------------------------------------------------
+// 4. Logout / Disconnect Channel
+// -------------------------------------------------------------
+export async function logoutUser(): Promise<{ success: boolean; message?: string }> {
+  return await safeFetchJson<{ success: boolean; message?: string }>('/api/auth/logout', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ persona }),
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.message || 'Simulation connection failed');
-  return data;
 }
 
-export async function logoutUser(): Promise<void> {
-  const res = await fetch('/api/auth/logout', { method: 'POST' });
-  if (!res.ok) throw new Error('Logout failed');
-}
-
+// -------------------------------------------------------------
+// 5. Save Credentials (Worker & Local State)
+// -------------------------------------------------------------
 export async function saveCredentials(creds: {
   clientId?: string;
   clientSecret?: string;
   youtubeApiKey?: string;
+  geminiApiKey?: string;
 }): Promise<any> {
-  const res = await fetch('/api/config/save-credentials', {
+  return await safeFetchJson('/api/config/save-credentials', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(creds),
   });
-  return res.json();
 }
 
+// -------------------------------------------------------------
+// 6. Authorized Channel Dashboard
+// -------------------------------------------------------------
 export async function fetchMyDashboard(): Promise<{ channel: ChannelData; privateAnalytics: any }> {
-  const res = await fetch('/api/channel/my-dashboard');
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data.message || 'Failed to fetch dashboard');
-  }
-  return data;
+  return await safeFetchJson<{ channel: ChannelData; privateAnalytics: any }>('/api/channel/my-dashboard');
 }
 
+// -------------------------------------------------------------
+// 7. Analyze Public Channel
+// -------------------------------------------------------------
 export async function analyzePublicChannel(query: string): Promise<{
   source: string;
   channel: ChannelData;
   restrictedMetricsExplanation: any;
 }> {
-  const res = await fetch('/api/youtube/analyze-public', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query }),
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data.message || 'Failed to analyze public channel');
-  }
-  return data;
+  const encoded = encodeURIComponent(query.trim());
+  return await safeFetchJson<{
+    source: string;
+    channel: ChannelData;
+    restrictedMetricsExplanation: any;
+  }>(`/api/youtube/analyze-public?query=${encoded}`);
 }
 
+// -------------------------------------------------------------
+// 8. AI Channel Audit
+// -------------------------------------------------------------
 export async function requestAiAudit(channel: ChannelData): Promise<AiAuditReport> {
-  const res = await fetch('/api/ai/audit', {
+  return await safeFetchJson<AiAuditReport>('/api/ai/audit', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ channel }),
   });
-  if (!res.ok) throw new Error('Failed to generate AI Audit');
-  return res.json();
 }
 
+// -------------------------------------------------------------
+// 9. Viral Video Ideas Generator
+// -------------------------------------------------------------
 export async function requestVideoIdeas(channel: ChannelData, topic?: string): Promise<VideoIdea[]> {
-  const res = await fetch('/api/ai/video-ideator', {
+  return await safeFetchJson<VideoIdea[]>('/api/ai/video-ideator', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ channel, topic }),
   });
-  if (!res.ok) throw new Error('Failed to generate video ideas');
-  return res.json();
 }
 
+// -------------------------------------------------------------
+// 10. AI SEO Optimizer
+// -------------------------------------------------------------
 export async function requestSeoOptimization(title: string, targetNiche?: string): Promise<SeoOptimizationResult> {
-  const res = await fetch('/api/ai/seo-optimizer', {
+  return await safeFetchJson<SeoOptimizationResult>('/api/ai/seo-optimizer', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ title, targetNiche }),
   });
-  if (!res.ok) throw new Error('Failed to optimize SEO');
-  return res.json();
 }
 
+// -------------------------------------------------------------
+// 11. Channel Comparison / Benchmark
+// -------------------------------------------------------------
 export async function requestChannelComparison(channelA: ChannelData, channelB: ChannelData): Promise<ChannelComparisonResult> {
-  const res = await fetch('/api/ai/compare-channels', {
+  return await safeFetchJson<ChannelComparisonResult>('/api/ai/compare-channels', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ channelA, channelB }),
   });
-  if (!res.ok) throw new Error('Failed to compare channels');
-  return res.json();
 }
 
+// -------------------------------------------------------------
+// 12. Script Doctor
+// -------------------------------------------------------------
 export async function requestScriptDoctor(scriptIntro: string, targetAudience?: string): Promise<ScriptDoctorResult> {
-  const res = await fetch('/api/ai/script-doctor', {
+  return await safeFetchJson<ScriptDoctorResult>('/api/ai/script-doctor', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ scriptIntro, targetAudience }),
   });
-  if (!res.ok) throw new Error('Failed to diagnose script');
-  return res.json();
 }
 
+// -------------------------------------------------------------
+// 13. Thumbnail Studio
+// -------------------------------------------------------------
 export async function requestThumbnailStudio(title: string, niche?: string): Promise<ThumbnailStudioResult> {
-  const res = await fetch('/api/ai/thumbnail-studio', {
+  return await safeFetchJson<ThumbnailStudioResult>('/api/ai/thumbnail-studio', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ title, niche }),
   });
-  if (!res.ok) throw new Error('Failed to generate thumbnail concepts');
-  return res.json();
 }
 
+// -------------------------------------------------------------
+// 14. FEATURE 1: Best Time to Post
+// -------------------------------------------------------------
 export async function fetchBestTimeToPost(params: {
   channelHandleOrId?: string;
   timezone?: string;
   useConnected?: boolean;
-}): Promise<any> {
-  const res = await fetch('/api/analytics/best-time', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params),
+}): Promise<BestTimeAnalysisResponse> {
+  const query = new URLSearchParams({
+    channelHandleOrId: params.channelHandleOrId || '',
+    timezone: params.timezone || 'America/New_York',
+    useConnected: String(!!params.useConnected),
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.message || 'Failed to analyze best posting time');
-  return data;
+
+  return await safeFetchJson<BestTimeAnalysisResponse>(`/api/analytics/best-time?${query.toString()}`);
 }
 
+// -------------------------------------------------------------
+// 15. FEATURE 2: Keyword Gap Checker
+// -------------------------------------------------------------
 export async function requestKeywordGap(params: {
   videoInput: string;
   existingTags?: string[];
   existingDescription?: string;
   topic?: string;
-}): Promise<any> {
-  const res = await fetch('/api/ai/keyword-gap', {
+}): Promise<KeywordGapResponse> {
+  return await safeFetchJson<KeywordGapResponse>('/api/ai/keyword-gap', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(params),
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.message || 'Failed to check keyword gap');
-  return data;
 }
 
+// -------------------------------------------------------------
+// 16. FEATURE 3: Next Video Plan
+// -------------------------------------------------------------
 export async function requestNextVideoPlan(params: {
   channel?: ChannelData;
   niche?: string;
-}): Promise<any> {
-  const res = await fetch('/api/ai/next-video-plan', {
+}): Promise<NextVideoPlanResponse> {
+  return await safeFetchJson<NextVideoPlanResponse>('/api/ai/next-video-plan', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(params),
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.message || 'Failed to generate next video plan');
-  return data;
 }
-

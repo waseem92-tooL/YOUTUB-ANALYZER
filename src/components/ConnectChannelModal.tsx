@@ -12,7 +12,7 @@ import {
   Flame,
 } from 'lucide-react';
 import type { ConfigStatus } from '../types.ts';
-import { getGoogleAuthUrl, simulateConnect } from '../services/api.ts';
+import { getGoogleAuthUrl, simulateConnect, fetchAuthStatus } from '../services/api.ts';
 
 interface ConnectChannelModalProps {
   isOpen: boolean;
@@ -41,7 +41,11 @@ export const ConnectChannelModal: React.FC<ConnectChannelModalProps> = ({
     try {
       const authData = await getGoogleAuthUrl();
       if (!authData.url) {
-        throw new Error('Google OAuth authorization URL could not be generated.');
+        setConnecting(false);
+        setErrorMessage(
+          'Google OAuth Client ID is not configured yet. You can use the 1-Click Instant Preview channels below, or add your Google Client ID / API Key in Settings.'
+        );
+        return;
       }
 
       // Open OAuth popup window directly to Google accounts authorization URL
@@ -59,32 +63,51 @@ export const ConnectChannelModal: React.FC<ConnectChannelModalProps> = ({
         return;
       }
 
-      // Handler for popup postMessage
-      const handleMessage = (event: MessageEvent) => {
-        // Validate origin
-        const origin = event.origin;
-        if (!origin.endsWith('.run.app') && !origin.includes('localhost')) {
-          return;
-        }
+      // Handler for popup postMessage & Polling for session cookie
+      let pollTimer: any = null;
+      const cleanup = () => {
+        if (pollTimer) clearInterval(pollTimer);
+        window.removeEventListener('message', handleMessage);
+      };
 
+      const handleMessage = (event: MessageEvent) => {
         if (event.data?.type === 'OAUTH_AUTH_SUCCESS') {
-          window.removeEventListener('message', handleMessage);
+          cleanup();
           setConnecting(false);
           onSuccess();
           onClose();
         } else if (event.data?.type === 'OAUTH_AUTH_ERROR') {
-          window.removeEventListener('message', handleMessage);
+          cleanup();
           setConnecting(false);
           setErrorMessage(event.data.error || 'Authentication failed. Please check permissions.');
         }
       };
 
       window.addEventListener('message', handleMessage);
+
+      // Poll session status every 1.5 seconds to detect cookie completion
+      pollTimer = setInterval(async () => {
+        try {
+          const authCheck = await fetchAuthStatus();
+          if (authCheck.authenticated) {
+            cleanup();
+            if (popup && !popup.closed) popup.close();
+            setConnecting(false);
+            onSuccess();
+            onClose();
+          } else if (popup.closed) {
+            cleanup();
+            setConnecting(false);
+          }
+        } catch {
+          // continue polling
+        }
+      }, 1500);
     } catch (err: any) {
       console.error('OAuth start error:', err);
       setConnecting(false);
       setErrorMessage(
-        err.message || 'Failed to start Google OAuth process. Configure Google Cloud credentials or try Test Mode.'
+        err.message || 'Failed to start Google OAuth process. Use 1-click Test Mode or configure API keys.'
       );
     }
   };
@@ -187,7 +210,7 @@ export const ConnectChannelModal: React.FC<ConnectChannelModalProps> = ({
             </button>
 
             <p className="text-[11px] text-slate-400 text-center leading-relaxed">
-              Every user authorizes their own channel. Your tokens are protected in backend session cookies and never shared.
+              Fully static client-side mode. Your session and credentials remain stored in your private browser storage.
             </p>
           </div>
 
